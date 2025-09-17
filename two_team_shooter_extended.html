@@ -1,0 +1,347 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Two-Team Shooter — Extended (Bots, Weapons, CTF, Network)</title>
+  <style>
+    body { background:#0b1220; color:#ddd; font-family:system-ui,Segoe UI,Roboto,Arial; margin:0; display:flex; align-items:center; justify-content:center; padding:18px; }
+    #wrap { width:1000px; }
+    canvas { background:#08101a; border-radius:10px; box-shadow:0 10px 40px rgba(0,0,0,0.6); display:block; }
+    #ui { display:flex; gap:12px; margin-top:8px; align-items:center; color:#cfd8dc; }
+    .score { font-weight:700; }
+    .teamBlue { color:#67e8f9; }
+    .teamRed { color:#fb7185; }
+    .panel { background:rgba(255,255,255,0.02); padding:8px 10px; border-radius:8px; }
+    button, input { font:inherit; }
+    #network input { width:220px; }
+    .hint { color:#9aa; }
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="1000" height="640"></canvas>
+  <div id="ui">
+    <div class="panel">
+      <span class="teamBlue score" id="blueScore">Blue: 0</span>
+      &nbsp;|&nbsp;
+      <span class="teamRed score" id="redScore">Red: 0</span>
+      &nbsp;•&nbsp;<span id="mode">Mode: Deathmatch</span>
+    </div>
+
+    <div class="panel" style="flex:1">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="hint">Blue: WASD + F (shoot) / Q (switch) / E (grenade) &nbsp;•&nbsp; Red: Arrows + / (shoot) / , (switch) / . (grenade)</div>
+        <div id="status"></div>
+      </div>
+    </div>
+
+    <div id="network" class="panel">
+      <input id="wsUrl" placeholder="wss://your-server.example (optional)" />
+      <button id="connectBtn">Connect</button>
+      <button id="hostBtn">Host Local</button>
+      <label><input type="checkbox" id="fillBots" checked/> Fill with bots</label>
+    </div>
+
+    <div class="panel">
+      <select id="modeSelect"><option>Deathmatch</option><option>Capture the Flag</option></select>
+      <button id="restart">Restart</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/*
+  Extended two-team shooter with:
+   - simple AI bots
+   - weapon variety: pistol, rifle (auto), shotgun, grenade
+   - Capture the Flag mode
+   - optional online multiplayer via WebSocket (you provide server URL that just echoes/broadcasts JSON messages)
+
+  Notes on networking: This client sends compact state updates and receives others'. A simple websocket message broker that forwards messages between clients will allow basic multiplayer. For production you'd add authoritative server logic.
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// Game constants
+const PLAYER_RADIUS = 14;
+const BULLET_RADIUS = 4;
+const GRAVITY = 0.12; // for grenades
+const RESPAWN_TIME = 1400;
+const SCORE_TO_WIN = 7; // lower for demo
+
+// Obstacles and bases
+const obstacles = [
+  {x: 360, y: 80, w: 280, h: 20},
+  {x: 120, y: 260, w: 20, h: 180},
+  {x: 860, y: 260, w: 20, h: 180},
+  {x: 300, y: 520, w: 400, h: 24}
+];
+
+// Flags for CTF
+const flags = {
+  blue: {x:80,y:80,home:{x:80,y:80},heldBy:null,carrier:null},
+  red: {x:920,y:560,home:{x:920,y:560},heldBy:null,carrier:null}
+};
+
+// Weapons
+const WEAPONS = {
+  pistol: {name:'Pistol', fireRate: 250, bullets:1, spread:0.06, speed:6.5, damage:28},
+  rifle:  {name:'Rifle', fireRate: 90, bullets:1, spread:0.02, speed:8.5, damage:20},
+  shotgun:{name:'Shotgun', fireRate: 600, bullets:7, spread:0.45, speed:6.0, damage:9},
+  grenade:{name:'Grenade', fireRate:900, bullets:0, spread:0, speed:6.0, damage:60, area:48}
+};
+
+// Utility
+const clamp = (v,a,b)=> Math.max(a,Math.min(b,v));
+const rnd = (a,b)=> a + Math.random()*(b-a);
+
+// Player template
+function makePlayer(id, team, x,y, isBot=false){
+  return {
+    id, team, x,y, vx:0, vy:0, alive:true, hp:100, score:0, isBot,
+    lastDir:{x:1,y:0}, weaponKeys: ['pistol','rifle','shotgun','grenade'], weaponIndex:0, lastShot:0,
+    respawnAt:0, carryingFlag: null, name:id
+  };
+}
+
+// Two human players by default
+let players = [
+  makePlayer('blue', 'blue', 80, 560, false),
+  makePlayer('red', 'red', 920, 80, false)
+];
+
+let bullets = []; // bullets and grenades
+let botsEnabled = true;
+let gameMode = 'Deathmatch';
+let gameOver=false; let winner=null;
+
+// Networking
+let ws = null;
+let clientId = String(Math.floor(Math.random()*1e6));
+let connected = false;
+
+function connectWS(url){
+  if(!url) return setStatus('No websocket url');
+  ws = new WebSocket(url);
+  ws.onopen = ()=>{ connected=true; setStatus('WS connected'); sendJoin(); };
+  ws.onmessage = ev=>{
+    try{ const m = JSON.parse(ev.data); handleNetworkMessage(m); }catch(e){}
+  };
+  ws.onclose = ()=>{ connected=false; setStatus('WS closed'); };
+  ws.onerror = ()=>{ connected=false; setStatus('WS error'); };
+}
+
+function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+
+function sendJoin(){ send({t:'join',id:clientId}); }
+
+function handleNetworkMessage(m){
+  if(m.t === 'state'){
+    // update remote players (simple merge)
+    const id = m.id; if(id === clientId) return;
+    let p = players.find(x=>x.id===m.id);
+    if(!p){ p = makePlayer(m.id, m.team, m.x,m.y, true); players.push(p); }
+    p.x=m.x; p.y=m.y; p.vx=m.vx; p.vy=m.vy; p.hp=m.hp; p.alive=m.alive; p.weaponIndex=m.weaponIndex; p.carryingFlag=m.carryingFlag;
+  } else if(m.t==='bullet'){
+    // spawn remote bullet
+    bullets.push(m.b);
+  }
+}
+
+// Input
+let keysDown = new Set();
+window.addEventListener('keydown', e=>{ keysDown.add(e.key); if(e.key==='r' || e.key==='R') restart(); });
+window.addEventListener('keyup', e=> keysDown.delete(e.key));
+
+document.getElementById('connectBtn').onclick = ()=> connectWS(document.getElementById('wsUrl').value.trim());
+document.getElementById('hostBtn').onclick = ()=> setStatus('Local host — playing without server');
+document.getElementById('fillBots').onchange = (e)=> botsEnabled = e.target.checked;
+document.getElementById('modeSelect').onchange = (e)=>{ gameMode = e.target.value; document.getElementById('mode').textContent = 'Mode: '+gameMode; restart(); };
+document.getElementById('restart').onclick = restart;
+
+function setStatus(t){ document.getElementById('status').textContent = t; }
+
+// Spawning and restart
+function spawnAtTeam(team){ return team==='blue' ? {x:80,y:560} : {x:920,y:80}; }
+
+function restart(){
+  bullets=[]; flags.blue.x=flags.blue.home.x; flags.blue.y=flags.blue.home.y; flags.blue.heldBy=null; flags.red.x=flags.red.home.x; flags.red.y=flags.red.home.y; flags.red.heldBy=null;
+  players = players.filter(p=>!p.isRemote);
+  // keep humans, fill bots
+  if(players.length<2){ players = [makePlayer('blue','blue',80,560,false), makePlayer('red','red',920,80,false)]; }
+  // assign teams and spawn
+  players.forEach((p,i)=>{ p.score=0; p.hp=100; p.alive=true; p.respawnAt=0; p.weaponIndex=0; p.carryingFlag=null; const s=spawnAtTeam(p.team); p.x=s.x; p.y=s.y; });
+  // add bots if enabled up to 2 extra per team
+  if(botsEnabled){
+    const desired = 4; // total players
+    while(players.length < desired){ const team = players.length%2===0?'blue':'red'; players.push(makePlayer('bot'+Math.floor(Math.random()*1e5), team, spawnAtTeam(team).x,spawnAtTeam(team).y, true)); }
+  }
+  gameOver=false; winner=null; updateScores();
+}
+
+// Weapons firing
+function fireWeapon(p){
+  const now = performance.now();
+  const weapon = WEAPONS[p.weaponKeys[p.weaponIndex]];
+  if(!weapon) return;
+  if(now - p.lastShot < weapon.fireRate) return;
+  p.lastShot = now;
+  if(weapon === WEAPONS.grenade){
+    // spawn grenade with parabolic arc
+    const dir = p.lastDir; const mag = Math.hypot(dir.x,dir.y)||1; const nx=dir.x/mag, ny=dir.y/mag;
+    bullets.push({type:'grenade', x:p.x + nx*(PLAYER_RADIUS+6), y:p.y + ny*(PLAYER_RADIUS+6), vx:nx*weapon.speed, vy:ny*weapon.speed -2, owner:p.id, team:p.team, life:3000, damage:weapon.damage, area:weapon.area});
+  } else {
+    for(let i=0;i<weapon.bullets;i++){
+      const spread = (Math.random()-0.5)*weapon.spread;
+      const dir = p.lastDir; const mag = Math.hypot(dir.x,dir.y)||1; let nx = dir.x/mag, ny = dir.y/mag;
+      // rotate by spread
+      const ang = Math.atan2(ny,nx) + spread;
+      const sx = Math.cos(ang), sy = Math.sin(ang);
+      bullets.push({type:'bullet', x:p.x + sx*(PLAYER_RADIUS+6), y:p.y + sy*(PLAYER_RADIUS+6), vx:sx*weapon.speed, vy:sy*weapon.speed, owner:p.id, team:p.team, damage:weapon.damage, life:1600});
+    }
+  }
+}
+
+function switchWeapon(p, dir){ p.weaponIndex = (p.weaponIndex + dir + p.weaponKeys.length) % p.weaponKeys.length; }
+
+// Simple AI
+function runBotAI(p, dt){
+  if(!p.alive) return;
+  // find nearest enemy
+  const enemies = players.filter(x=>x.team!==p.team && x.alive);
+  if(enemies.length===0) return;
+  // if CTF, prioritize flags
+  let target = null;
+  if(gameMode === 'Capture the Flag'){
+    const enemyFlag = flags[p.team==='blue'?'red':'blue'];
+    if(!enemyFlag.heldBy){ target = {x:enemyFlag.x,y:enemyFlag.y}; }
+    else { target = enemies[Math.floor(Math.random()*enemies.length)]; }
+  } else {
+    // Deathmatch: pick nearest
+    let best=1e9; for(const e of enemies){ const d = Math.hypot(e.x-p.x,e.y-p.y); if(d<best){best=d; target=e;} }
+  }
+  if(!target) return;
+  // move toward target with some randomness
+  const dx = target.x - p.x, dy = target.y - p.y; const m=Math.hypot(dx,dy)||1; p.vx = (dx/m)*1.6; p.vy = (dy/m)*1.6; p.lastDir={x:p.vx,y:p.vy};
+  // shoot if roughly facing enemy and in range
+  if(target.x !== undefined){ const d = Math.hypot(target.x-p.x,target.y-p.y); if(d<420){ if(Math.random()<0.015) fireWeapon(p); } }
+}
+
+// Physics and collisions
+function circleRectColl(cx,cy,cr,rx,ry,rw,rh){ const nx = clamp(cx, rx, rx+rw); const ny = clamp(cy, ry, ry+rh); return Math.hypot(nx-cx, ny-cy) <= cr; }
+
+function update(dt){
+  // player input
+  players.forEach(p=>{
+    if(!p.alive){ if(performance.now() >= p.respawnAt){ p.alive=true; p.hp=100; const s=spawnAtTeam(p.team); p.x=s.x; p.y=s.y; p.carryingFlag=null; } return; }
+    if(p.isBot){ runBotAI(p, dt); return; }
+    // human control mapping
+    let dx=0, dy=0;
+    if(p.team==='blue'){
+      if(keysDown.has('w')) dy -= 1; if(keysDown.has('s')) dy += 1; if(keysDown.has('a')) dx -= 1; if(keysDown.has('d')) dx += 1;
+      if(keysDown.has('f')) fireWeapon(p);
+      if(keysDown.has('q')){ switchWeapon(p,-1); keysDown.delete('q'); }
+      if(keysDown.has('e')){ fireWeapon(p); keysDown.delete('e'); }
+    } else {
+      if(keysDown.has('ArrowUp')) dy -= 1; if(keysDown.has('ArrowDown')) dy += 1; if(keysDown.has('ArrowLeft')) dx -= 1; if(keysDown.has('ArrowRight')) dx += 1;
+      if(keysDown.has('/')) fireWeapon(p);
+      if(keysDown.has(',')){ switchWeapon(p,-1); keysDown.delete(','); }
+      if(keysDown.has('.')){ fireWeapon(p); keysDown.delete('.'); }
+    }
+    if(dx!==0 || dy!==0){ const m = Math.hypot(dx,dy)||1; p.vx = (dx/m)*2.6; p.vy = (dy/m)*2.6; p.lastDir={x:p.vx,y:p.vy}; } else { p.vx = p.vy = 0; }
+    // basic collision with obstacles
+    let nx = p.x + p.vx; let ny = p.y + p.vy; nx = clamp(nx, PLAYER_RADIUS, W-PLAYER_RADIUS); ny = clamp(ny, PLAYER_RADIUS, H-PLAYER_RADIUS);
+    const coll = obstacles.some(o=> circleRectColl(nx,ny,PLAYER_RADIUS,o.x,o.y,o.w,o.h)); if(!coll){ p.x=nx; p.y=ny; }
+    // flag pickup if in CTF
+    if(gameMode === 'Capture the Flag'){
+      const enemyFlag = flags[p.team==='blue'?'red':'blue'];
+      if(!enemyFlag.heldBy){ if(Math.hypot(enemyFlag.x-p.x, enemyFlag.y-p.y) < PLAYER_RADIUS+8){ enemyFlag.heldBy = p.id; p.carryingFlag = enemyFlag; } }
+      // deliver if at own base
+      const myBase = flags[p.team].home; if(p.carryingFlag && Math.hypot(myBase.x-p.x,myBase.y-p.y) < 28){ // score
+        p.score += 1; p.carryingFlag.heldBy = null; p.carryingFlag.x = p.carryingFlag.home.x; p.carryingFlag.y = p.carryingFlag.home.y; p.carryingFlag = null; updateScores(); checkWin(); }
+    }
+  });
+
+  // bullets
+  for(let i=bullets.length-1;i>=0;i--){ const b=bullets[i]; if(b.type==='bullet'){
+      b.x += b.vx; b.y += b.vy; b.life -= dt; if(b.life<=0 || b.x<-20 || b.x>W+20 || b.y<-20 || b.y>H+20){ bullets.splice(i,1); continue; }
+      // obstacle
+      if(obstacles.some(o=> circleRectColl(b.x,b.y,BULLET_RADIUS,o.x,o.y,o.w,o.h))){ bullets.splice(i,1); continue; }
+      // hit players
+      for(const p of players){ if(!p.alive) continue; if(p.team===b.team) continue; if(Math.hypot(p.x-b.x,p.y-b.y) <= PLAYER_RADIUS+BULLET_RADIUS){ p.hp -= b.damage; bullets.splice(i,1); if(p.hp<=0){ die(p, b.owner); } break; } }
+    } else if(b.type==='grenade'){
+      b.vy += GRAVITY; b.x += b.vx; b.y += b.vy; b.life -= dt;
+      // collide with ground/obstacles
+      if(b.y >= H-6 || obstacles.some(o=> circleRectColl(b.x,b.y,6,o.x,o.y,o.w,o.h)) || b.life<=0){ // explode
+        // area damage
+        for(const p of players){ if(!p.alive || p.team===b.team) continue; const d = Math.hypot(p.x-b.x,p.y-b.y); if(d <= b.area){ p.hp -= b.damage * (1 - d/b.area); if(p.hp<=0) die(p, b.owner); } }
+        bullets.splice(i,1);
+      }
+    }
+  }
+
+  // flags follow carriers
+  if(gameMode==='Capture the Flag'){
+    ['blue','red'].forEach(fn=>{ const f=flags[fn]; if(f.heldBy){ const carrier = players.find(x=>x.id===f.heldBy); if(carrier){ f.x = carrier.x + 0; f.y = carrier.y - PLAYER_RADIUS - 8; } else { f.heldBy=null; f.x=f.home.x; f.y=f.home.y; } } });
+  }
+
+  // bots maybe spawning actions
+  players.forEach(p=>{ if(p.isBot){ if(Math.random()<0.002) switchWeapon(p,1); if(Math.random()<0.01) fireWeapon(p); } });
+
+  // send network state occasionally
+  if(connected){ players.forEach(p=>{ if(!p.isBot){ send({t:'state', id:p.id, team:p.team, x:p.x, y:p.y, vx:p.vx, vy:p.vy, hp:p.hp, alive:p.alive, weaponIndex:p.weaponIndex, carryingFlag: p.carryingFlag?true:false }); } }); }
+}
+
+function die(p, killerId){ p.alive=false; p.respawnAt = performance.now() + RESPAWN_TIME; p.hp=0; p.carryingFlag = null; if(killerId){ const killer = players.find(x=>x.id===killerId); if(killer) { killer.score += 1; updateScores(); checkWin(); } }
+}
+
+function updateScores(){ document.getElementById('blueScore').textContent = 'Blue: '+players.filter(p=>p.team==='blue').reduce((s,p)=>s+p.score,0); document.getElementById('redScore').textContent = 'Red: '+players.filter(p=>p.team==='red').reduce((s,p)=>s+p.score,0); }
+
+function checkWin(){ const blue = players.filter(p=>p.team==='blue').reduce((s,p)=>s+p.score,0); const red = players.filter(p=>p.team==='red').reduce((s,p)=>s+p.score,0); if(blue >= SCORE_TO_WIN || red >= SCORE_TO_WIN){ gameOver=true; winner = blue>red?'Blue':'Red'; setStatus(winner+' wins! Press Restart'); }
+}
+
+function draw(){
+  // background
+  ctx.fillStyle = '#08101a'; ctx.fillRect(0,0,W,H);
+  // obstacles
+  for(const o of obstacles){ ctx.fillStyle='#22323b'; ctx.fillRect(o.x,o.y,o.w,o.h); ctx.strokeStyle='rgba(255,255,255,0.03)'; ctx.strokeRect(o.x,o.y,o.w,o.h); }
+
+  // flags
+  if(gameMode==='Capture the Flag'){
+    ['blue','red'].forEach(fn=>{ const f=flags[fn]; ctx.save(); ctx.beginPath(); ctx.arc(f.x,f.y,8,0,Math.PI*2); ctx.fillStyle = fn==='blue'?'#67e8f9':'#fb7185'; ctx.fill(); ctx.fillStyle='#111'; ctx.fillRect(f.x-6,f.y,12,3); ctx.restore(); });
+  }
+
+  // bullets
+  for(const b of bullets){ if(b.type==='bullet'){ ctx.beginPath(); ctx.arc(b.x,b.y,BULLET_RADIUS,0,Math.PI*2); ctx.fillStyle = b.team==='blue'? '#7dd3fc':'#fda4af'; ctx.fill(); } else if(b.type==='grenade'){ ctx.beginPath(); ctx.arc(b.x,b.y,6,0,Math.PI*2); ctx.fillStyle='#facc15'; ctx.fill(); } }
+
+  // players
+  players.forEach(p=>{
+    if(!p.alive){ ctx.globalAlpha=0.35; ctx.beginPath(); ctx.arc(p.x,p.y,PLAYER_RADIUS,0,Math.PI*2); ctx.fillStyle = p.team==='blue'? '#67e8f9':'#fb7185'; ctx.fill(); ctx.globalAlpha=1; return; }
+    ctx.beginPath(); ctx.arc(p.x,p.y,PLAYER_RADIUS,0,Math.PI*2); ctx.fillStyle = p.team==='blue'? '#67e8f9':'#fb7185'; ctx.fill();
+    // facing
+    const fd = p.lastDir; const mag=Math.hypot(fd.x,fd.y)||1; const fx = p.x + (fd.x/mag)*(PLAYER_RADIUS+6); const fy = p.y + (fd.y/mag)*(PLAYER_RADIUS+6); ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(fx,fy); ctx.strokeStyle='#111'; ctx.lineWidth=3; ctx.stroke();
+    // name
+    ctx.fillStyle='#000'; ctx.fillRect(p.x-26, p.y+18, 52,14); ctx.fillStyle='#fff'; ctx.font='12px system-ui'; ctx.textAlign='center'; ctx.fillText(p.name, p.x, p.y+30);
+    // health
+    const barW=40; const bw = Math.max(0, barW*(p.hp/100)); ctx.fillStyle='#111'; ctx.fillRect(p.x-barW/2-1, p.y-PLAYER_RADIUS-14-1, barW+2, 8+2); ctx.fillStyle='#444'; ctx.fillRect(p.x-barW/2, p.y-PLAYER_RADIUS-14, barW, 8); ctx.fillStyle=(p.hp>50)?'#6ee7b7':(p.hp>20?'#fde68a':'#fb7185'); ctx.fillRect(p.x-barW/2, p.y-PLAYER_RADIUS-14, bw, 8);
+    // weapon label
+    ctx.fillStyle='#cbd5e1'; ctx.font='11px system-ui'; ctx.fillText(WEAPONS[p.weaponKeys[p.weaponIndex]].name, p.x, p.y-PLAYER_RADIUS-20);
+  });
+
+  // HUD center
+  ctx.fillStyle='rgba(255,255,255,0.02)'; ctx.fillRect(W/2 -1, 0, 2, H);
+
+  if(gameOver){ ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,H/2-60,W,140); ctx.fillStyle='#ffd166'; ctx.font='36px system-ui'; ctx.textAlign='center'; ctx.fillText(winner+' team wins!', W/2, H/2); ctx.font='18px system-ui'; ctx.fillText('Press Restart', W/2, H/2+36); ctx.textAlign='start'; }
+}
+
+let lastTick = performance.now();
+function loop(now){ const dt = now - lastTick; lastTick = now; if(!gameOver) update(dt); draw(); requestAnimationFrame(loop); }
+
+// initial setup
+restart(); requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
