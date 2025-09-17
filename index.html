@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Two Team Shooter Extended</title>
+  <style>
+    body { margin: 0; background: #222; overflow: hidden; }
+    canvas { display: block; margin: auto; background: #333; }
+    #scoreboard {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      color: white; font-family: Arial, sans-serif; font-size: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div id="scoreboard">Red: 0 | Blue: 0</div>
+  <canvas id="gameCanvas" width="800" height="600"></canvas>
+  <script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    class Player {
+      constructor(x, y, color, team) {
+        this.x = x; this.y = y; this.color = color; this.team = team;
+        this.width = 20; this.height = 20;
+        this.speed = 3;
+        this.bullets = [];
+        this.score = 0;
+        this.bot = false;
+      }
+      draw() {
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, this.width, this.height);
+      }
+      move(keys) {
+        if (keys["ArrowUp"]) this.y -= this.speed;
+        if (keys["ArrowDown"]) this.y += this.speed;
+        if (keys["ArrowLeft"]) this.x -= this.speed;
+        if (keys["ArrowRight"]) this.x += this.speed;
+        this.x = Math.max(0, Math.min(canvas.width - this.width, this.x));
+        this.y = Math.max(0, Math.min(canvas.height - this.height, this.y));
+      }
+      shoot() {
+        this.bullets.push({ x: this.x + this.width/2, y: this.y, dy: (this.team === "red" ? -5 : 5) });
+      }
+      updateBullets(players) {
+        this.bullets.forEach((b, i) => {
+          b.y += b.dy;
+          ctx.fillStyle = "yellow";
+          ctx.fillRect(b.x, b.y, 5, 10);
+          players.forEach(p => {
+            if (p.team !== this.team &&
+                b.x < p.x + p.width &&
+                b.x + 5 > p.x &&
+                b.y < p.y + p.height &&
+                b.y + 10 > p.y) {
+              this.score++;
+              this.bullets.splice(i, 1);
+            }
+          });
+        });
+      }
+    }
+
+    const player1 = new Player(400, 500, "red", "red");
+    const bot = new Player(400, 50, "blue", "blue");
+    bot.bot = true;
+    const players = [player1, bot];
+
+    const keys = {};
+    document.addEventListener("keydown", e => {
+      keys[e.key] = true;
+      if (e.key === " ") player1.shoot();
+    });
+    document.addEventListener("keyup", e => keys[e.key] = false);
+
+    function gameLoop() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      players.forEach(p => {
+        p.draw();
+        if (!p.bot) p.move(keys);
+        p.updateBullets(players);
+      });
+
+      // Simple bot AI
+      bot.x += (player1.x > bot.x ? 1 : -1) * bot.speed * 0.5;
+      if (Math.random() < 0.02) bot.shoot();
+
+      document.getElementById("scoreboard").textContent =
+        `Red: ${player1.score} | Blue: ${bot.score}`;
+
+      requestAnimationFrame(gameLoop);
+    }
+    gameLoop();
+  </script>
+</body>
+</html>
